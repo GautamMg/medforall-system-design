@@ -18,7 +18,7 @@ Design a scheduling system for a healthcare organization that:
   * buffers (before/after)
   * preferences and exceptions
 
-Healthcare scheduling is less about “calendar UI” and more about **correctness under concurrency**, **auditability**, **time-zone correctness**, and **patient safety**. A “mostly correct” scheduler is not acceptable: double bookings or incorrect availability directly impacts care delivery.
+Healthcare scheduling is less about "calendar UI" and more about **correctness under concurrency**, **auditability**, **time-zone correctness**, and **patient safety**. A "mostly correct" scheduler is not acceptable: double bookings or incorrect availability directly impacts care delivery.
 
 ### 1.2 Goals
 
@@ -32,11 +32,11 @@ Healthcare scheduling is less about “calendar UI” and more about **correctne
 
 **Non-functional**
 
-* **Correctness**: prevent double-booking.
-* **Low latency**: availability queries should feel interactive.
-* **Resilience**: degraded behavior must still be safe.
+* **Correctness**: prevent double-booking under all conditions.
+* **Low latency**: availability queries ≤200ms p95 (cached), ≤500ms (cold).
+* **Resilience**: degraded behavior must still be safe — never silently double-book.
 * **Observability**: trace and audit all scheduling changes.
-* **Security & privacy**: minimize PHI exposure, support least privilege, audit logs.
+* **Security & privacy**: tenant isolation, minimize PHI exposure, least privilege, audit logs.
 
 ### 1.3 Key Design Principle
 
@@ -49,108 +49,55 @@ Availability changes whenever:
 * rules or exceptions change,
 * a room/equipment becomes unavailable.
 
-Therefore, I treat “availability” as a computed view built from:
+Therefore, I treat "availability" as a computed view built from:
 
 * schedule rules (recurring availability),
 * exception rules,
 * buffers and constraints,
 * existing reservations.
 
-### 1.4 High-Level Architecture
+### 1.4 Capacity Planning (Back-of-Envelope)
 
-* **Scheduling API**: handles CRUD on appointments and rules, and computes availability.
+Before choosing architecture, the numbers:
+
+* **50,000 appointments/day** across 500 clinics → ~100 appointments/clinic/day.
+* Average booking rate: ~0.6 writes/sec. Not high in throughput terms.
+* **Peak load**: clinics open 8am–5pm local time across ~4 US time zones → effective booking window ~12 hours. Peak is Monday mornings: expect 3–5× average → ~2–3 writes/sec peak. Still modest.
+* **Availability queries are the real load driver**: each booking attempt may trigger 5–20 availability queries (browsing providers, dates, times). At peak: **30–60 availability reads/sec**. Each query computes slots from rules + reservations, touching multiple DB rows.
+* **DB size**: ~50k appointments/day × 365 = ~18M appointments/year. Each appointment generates 1–3 reservations → ~36–54M reservation rows/year. With indexes, this is well within a single Postgres instance for 2–3 years before partitioning becomes critical.
+* **WebSocket connections**: assuming 2–3 concurrent schedulers per clinic → ~1,000–1,500 active connections. A single WebSocket server handles this easily; can horizontally scale with sticky sessions or Redis pub/sub fanout.
+
+**Conclusion**: a single well-indexed Postgres primary with read replicas, Redis caching, and horizontally scaled stateless API nodes handles this comfortably. The architecture is designed to scale further (partitioning, sharding) but doesn't need it at launch.
+
+### 1.5 High-Level Architecture
+
+* **Scheduling API** (stateless, horizontally scaled): handles CRUD on appointments and rules, computes availability.
 * **PostgreSQL**: system-of-record for appointments, reservations, rules, audit logs.
 * **Redis**: short-lived caching for availability, idempotency keys, rate limiting, pub/sub.
-* **Event Bus + Workers**: outbound side effects (notifications, EHR sync, analytics) with reliable delivery.
-* **Real-time channel (WebSocket or SSE)**: publish invalidations/updates to connected clients.
+* **Event Bus + Workers**: outbound side effects (notifications, EHR sync, analytics) via transactional outbox for reliable delivery.
+* **Real-time channel (WebSocket/SSE)**: publish invalidation signals to connected clients.
 * **Web + Mobile clients**: consume REST APIs, subscribe to real-time updates.
 
-#### System diagram (Mermaid)
+#### System diagram
 
-```mermaid
-flowchart LR
-  subgraph Clients
-    W[Web App<br/>Next.js] 
-    M[Mobile App<br/>React Native]
-  end
+![System Architecture](./assets/System_Diagram.jpg)
 
-  W -->|HTTPS| GW[API Gateway / Edge]
-  M -->|HTTPS| GW
+### 1.6 Technology Choices
 
-  GW --> AUTH[AuthN/AuthZ<br/>OIDC/JWT]
-  GW --> SCHED[Scheduling Service<br/>TypeScript]
+| Choice | Why | Trade-off |
+|---|---|---|
+| **TypeScript (Node.js)** | Shared types with web/mobile clients; strong ecosystem for APIs, validation, testing | Less raw throughput than Go/Java; mitigated via caching + horizontal scale |
+| **PostgreSQL** | Transactional guarantees, range types, exclusion constraints for "no overlap" — the most critical requirement | Write scaling requires partitioning later; acceptable given capacity analysis |
+| **Redis** | Fast availability caching, idempotency keys, rate limiting, pub/sub for real-time invalidation | Never a correctness dependency — system must remain safe when Redis is down |
+| **WebSockets** | Bi-directional (enables future collaborative scheduling, presence indicators) | More complex than SSE; fallback to SSE for simpler deployments |
+| **Transactional Outbox** | Guarantees side effects (notifications, EHR sync) are delivered even if worker crashes mid-processing | Adds a polling/CDC mechanism; acceptable complexity for reliability |
 
-  SCHED --> PG[(PostgreSQL)]
-  SCHED --> R[(Redis)]
-  SCHED --> RT[Realtime Hub<br/>WebSocket/SSE]
+### 1.7 Integration Points
 
-  SCHED --> BUS[(Event Bus)]
-  BUS --> NOTIF[Notification Worker]
-  BUS --> EHR[EHR/EMR Integration Worker]
-  BUS --> ANALYTICS[Analytics/Reporting Pipeline]
-
-  NOTIF --> MSG[Email/SMS/Push Provider]
-```
-
-### 1.5 Technology Choices (with justification)
-
-**Backend language/framework: TypeScript (Node.js)**
-
-* Pros:
-
-  * Shared types with web/mobile clients.
-  * Strong ecosystem for web APIs, validation, testing.
-  * Good developer velocity for take-home context.
-* Cons:
-
-  * Not as performant as Go/Java under extreme throughput; mitigated via caching and horizontal scale.
-
-**Database: PostgreSQL**
-
-* Pros:
-
-  * Strong transactional guarantees.
-  * Excellent indexing + range types.
-  * Supports exclusion constraints (critical for “no overlapping reservations”).
-  * Mature tooling, reliable under moderate scale.
-* Cons:
-
-  * Scaling writes requires care; mitigated with partitioning and read replicas later.
-
-**Cache / coordination: Redis**
-
-* Pros:
-
-  * Fast caching for slot computation results.
-  * Useful for idempotency keys, token buckets (rate limiting).
-  * Pub/sub for real-time invalidation fanout.
-* Cons:
-
-  * Must never be a correctness dependency; system must remain safe when Redis is down.
-
-**Real-time updates: WebSockets**
-
-* Pros:
-
-  * Bi-directional (future: collaborative scheduling, presence, locking hints).
-  * Efficient for push updates and live refresh.
-* Cons:
-
-  * More operational complexity than SSE; can fall back to SSE for simpler deployments.
-
-**Async processing: Event bus + outbox**
-
-* I treat notifications/EHR sync as asynchronous side effects:
-
-  * Scheduling writes commit first (safe).
-  * Side effects emitted via outbox to guarantee delivery.
-
-### 1.6 Integration Points
-
-* **Identity / SSO**: OIDC provider (Okta/Auth0/Azure AD) for staff users.
-* **EHR/EMR**: HL7/FHIR or vendor APIs for patient/provider context and appointment sync.
+* **Identity / SSO**: OIDC provider (Okta/Auth0/Azure AD) for staff authentication.
+* **EHR/EMR**: HL7 FHIR or vendor APIs for patient/provider context and appointment sync.
 * **Messaging**: email/SMS/push providers for reminders and changes.
-* **Analytics**: event stream for scheduling metrics and utilization.
+* **Analytics**: event stream for scheduling metrics and utilization dashboards.
 
 ---
 
@@ -158,371 +105,180 @@ flowchart LR
 
 ### 2.1 Core Entities & Relationships
 
-At minimum:
+* **Clinic** — has timezone, policies, resources.
+* **Provider** — belongs to one or more clinics.
+* **Room** — belongs to clinic.
+* **Equipment** — belongs to clinic, may have capacity > 1.
+* **AppointmentType** — duration, buffer rules, resource requirements.
+* **Appointment** — patient + provider + scheduled time + status.
+* **Reservation** — blocks provider/room/equipment time windows (source of "no overlap" constraint).
+* **ScheduleRule** — recurring working hours (provider and/or room).
+* **ScheduleException** — overrides (PTO, holiday, maintenance).
+* **AuditLog** — immutable record of all changes.
 
-* **Clinic**
-
-  * has timezone, policies, resources.
-* **Provider**
-
-  * belongs to one or more clinics.
-* **Room**
-
-  * belongs to clinic.
-* **Equipment**
-
-  * belongs to clinic, may have capacity > 1.
-* **AppointmentType**
-
-  * duration, buffer rules, resource requirements.
-* **Appointment**
-
-  * patient + provider + scheduled time + status.
-* **Reservation**
-
-  * blocks provider/room/equipment time windows (source of “no overlap” constraint).
-* **ScheduleRule**
-
-  * recurring working hours (provider and/or room).
-* **ScheduleException**
-
-  * overrides (PTO, holiday, maintenance).
-* **AuditLog**
-
-  * immutable record of changes.
-
-Key relationship choice:
-
-* Every appointment maps to **one or more reservations**:
-
-  * provider reservation (always)
-  * room reservation (if in-person)
-  * equipment reservation (if required)
+Key relationship: every appointment maps to **one or more reservations** — provider reservation (always), room reservation (if in-person), equipment reservation (if required by appointment type).
 
 ### 2.2 PostgreSQL Schema (conceptual)
 
 #### Clinic
 
-* `id (uuid)`
-* `name`
-* `timezone` (IANA string)
-* `created_at`
+* `id (uuid)`, `name`, `timezone` (IANA string, e.g. "America/New_York"), `created_at`
 
 #### Provider
 
-* `id (uuid)`
-* `clinic_id`
-* `name`
-* `specialty`
-* `active`
+* `id (uuid)`, `clinic_id` (FK), `name`, `specialty`, `active` (bool)
 
 #### Room
 
-* `id (uuid)`
-* `clinic_id`
-* `name`
-* `capacity` (usually 1 for exam rooms)
+* `id (uuid)`, `clinic_id` (FK), `name`, `capacity` (default 1 for exam rooms)
 
 #### Equipment
 
-* `id (uuid)`
-* `clinic_id`
-* `name`
-* `capacity` (e.g., 2 infusion pumps)
+* `id (uuid)`, `clinic_id` (FK), `name`, `capacity` (e.g., 2 infusion pumps)
 
 #### AppointmentType
 
-* `id (uuid)`
-* `clinic_id`
-* `name`
-* `duration_minutes`
-* `buffer_before_minutes`
-* `buffer_after_minutes`
-* `mode` (`in_person | telehealth | phone`)
-* `requires_room` (bool)
-* `required_equipment_ids` (or join table)
+* `id (uuid)`, `clinic_id` (FK), `name`, `duration_minutes`, `buffer_before_minutes`, `buffer_after_minutes`
+* `mode` (`in_person | telehealth | phone`), `requires_room` (bool), `required_equipment_ids` (join table)
 
 #### Appointment
 
-* `id (uuid)`
-* `clinic_id`
-* `patient_id` (reference or external ID)
-* `provider_id`
-* `appointment_type_id`
-* `start_time_utc (timestamptz)`
-* `end_time_utc (timestamptz)`
-* `status` (`scheduled|cancelled|completed|no_show|checked_in|in_progress`)
-* `reason`
-* `created_at`, `updated_at`
+* `id (uuid)`, `clinic_id` (FK), `patient_id`, `provider_id` (FK), `appointment_type_id` (FK)
+* `start_time_utc (timestamptz)`, `end_time_utc (timestamptz)`
+* `status` (`scheduled | cancelled | completed | no_show | checked_in | in_progress`)
+* `reason`, `created_at`, `updated_at`
 
 #### Reservation
 
-* `id (uuid)`
-* `clinic_id`
-* `resource_type` (`provider|room|equipment`)
-* `resource_id`
-* `time_range_utc` (`tstzrange`)  ← critical
-* `appointment_id`
-* `created_at`
+* `id (uuid)`, `clinic_id` (FK), `resource_type` (`provider | room | equipment`), `resource_id`
+* `time_range_utc` (`tstzrange`) ← critical for overlap detection
+* `appointment_id` (FK), `created_at`
 
 #### ScheduleRule (recurrence)
 
-* `id (uuid)`
-* `clinic_id`
-* `resource_type` (`provider|room|equipment`)
-* `resource_id`
-* `day_of_week` (0-6)
-* `start_local_time` (e.g., 09:00)
-* `end_local_time` (e.g., 17:00)
-* `effective_from`, `effective_to` (dates)
-* `created_at`
+* `id (uuid)`, `clinic_id` (FK), `resource_type`, `resource_id`
+* `day_of_week` (0–6), `start_local_time`, `end_local_time`
+* `effective_from`, `effective_to` (date range for rule validity)
 
 #### ScheduleException
 
-* `id (uuid)`
-* `clinic_id`
-* `resource_type`
-* `resource_id`
-* `start_time_utc`
-* `end_time_utc`
-* `type` (`pto|holiday|maintenance|custom_block`)
-* `note`
-* `created_at`
+* `id (uuid)`, `clinic_id` (FK), `resource_type`, `resource_id`
+* `start_time_utc`, `end_time_utc`, `type` (`pto | holiday | maintenance | custom_block`), `note`
 
 #### AuditLog
 
-* `id (uuid)`
-* `clinic_id`
-* `actor_user_id`
-* `entity_type` (`appointment|rule|exception`)
-* `entity_id`
-* `action` (`create|update|cancel|reschedule`)
-* `before` (jsonb)
-* `after` (jsonb)
-* `created_at`
+* `id (uuid)`, `clinic_id`, `actor_user_id`, `entity_type`, `entity_id`
+* `action` (`create | update | cancel | reschedule`), `before` (jsonb), `after` (jsonb), `created_at`
 
-### 2.3 Concurrency Guarantee: “No Overlap” via Constraints
+### 2.3 Concurrency Guarantee: "No Overlap" via Exclusion Constraints
 
-The most important constraint is: **no two reservations for the same resource overlap**.
+The most important invariant: **no two reservations for the same resource overlap**.
 
-In PostgreSQL, the intended mechanism is:
+PostgreSQL exclusion constraints enforce this at the database level:
 
-* `time_range_utc` is `tstzrange(start, end)`
-* Create a GiST index and an exclusion constraint:
+* `time_range_utc` is stored as `tstzrange(start, end)`
+* Exclusion constraint:
 
-  * `EXCLUDE USING gist (resource_type WITH =, resource_id WITH =, time_range_utc WITH &&)`
+  `EXCLUDE USING gist (resource_type WITH =, resource_id WITH =, time_range_utc WITH &&)`
 
-Meaning: for a given resource, ranges cannot overlap (`&&`).
-
-This shifts correctness to the database:
-
-* even if two requests race, one insert will fail with a conflict, preventing double booking.
+For a given resource, ranges cannot overlap (`&&` operator). Even if two API servers race to book the same slot simultaneously, one INSERT will fail with a constraint violation — **correctness is enforced by the database, not application logic**.
 
 ### 2.4 Indexing Strategy (mapped to query patterns)
 
-Common query patterns:
-
-1. “Show availability for provider X in clinic Y for date range”
-2. “List appointments for a clinic/week”
-3. “List appointments for a provider/day”
-4. “Resolve conflicts / audit changes”
-
-Indexes:
-
-* `Reservation(resource_type, resource_id, time_range_utc)` GiST index for fast overlap queries.
-* `Appointment(clinic_id, start_time_utc)` btree for weekly views.
-* `Appointment(provider_id, start_time_utc)` btree for provider day view.
-* `ScheduleRule(resource_type, resource_id, day_of_week)` btree.
-* `ScheduleException(resource_type, resource_id, start_time_utc)` btree.
-* `AuditLog(entity_type, entity_id, created_at)` btree.
+| Query Pattern | Index |
+|---|---|
+| Availability: "reservations overlapping date range for provider X" | `Reservation(resource_type, resource_id, time_range_utc)` — GiST |
+| Weekly clinic view | `Appointment(clinic_id, start_time_utc)` — btree |
+| Provider day view | `Appointment(provider_id, start_time_utc)` — btree |
+| Rule lookup | `ScheduleRule(resource_type, resource_id, day_of_week)` — btree |
+| Exception lookup | `ScheduleException(resource_type, resource_id, start_time_utc)` — btree |
+| Audit trail | `AuditLog(entity_type, entity_id, created_at)` — btree |
 
 ---
 
 ## 3. Availability Engine
 
-### 3.1 What “Availability” Means
+### 3.1 What "Availability" Means
 
-A time slot is “available” if all required resources can be reserved for the appointment duration plus buffers:
+A time slot is "available" if **all** required resources can be reserved for the appointment duration plus buffers:
 
-* Provider is scheduled to work
-* Provider has no conflicting reservation
-* If in-person: room is available
+* Provider is scheduled to work (per ScheduleRules)
+* Provider has no conflicting reservation or exception
+* If in-person: at least one suitable room is available
 * If equipment required: equipment capacity supports the booking
-* Slot respects clinic-specific rules:
+* Slot respects clinic policies (minimum lead time, maximum advance booking window)
 
-  * minimum lead time
-  * maximum advance scheduling window
-  * appointment type constraints
+Availability is computed in the clinic's timezone but stored and enforced in UTC.
 
-Availability is computed in the clinic’s timezone but stored and enforced in UTC.
+### 3.2 Slot Computation Algorithm
 
-### 3.2 Slot Computation Approach
+Inputs: `clinicId`, `providerId` (or group), `appointmentTypeId`, date range `[from, to]` in local time, optional constraints (roomId, equipment preferences).
 
-Inputs:
+**Steps:**
 
-* `clinicId`
-* `providerId` (or provider group)
-* `appointmentTypeId`
-* date range `[from, to]` in local time
-* optional constraints: roomId, equipment preferences, patient constraints
+1. **Load scheduling rules** — provider working hours (recurring), room/equipment availability rules.
 
-Steps (high level):
+2. **Expand rules into candidate intervals** — e.g., "Mon 9–5, Tue 10–4" → concrete intervals for the requested date range.
 
-1. **Load scheduling rules**
+3. **Apply exceptions** — subtract PTO, holidays, maintenance blocks.
 
-   * provider working hours (recurring)
-   * room availability rules if needed
-   * equipment availability rules if needed
+4. **Compute effective duration** — `effective_duration = duration + buffer_before + buffer_after`
 
-2. **Expand rules into candidate availability intervals**
+5. **Subtract existing reservations** — query reservations for provider/room/equipment overlapping the range. Remove occupied ranges from candidate intervals.
 
-   * Example: “Mon 9–5, Tue 10–4”
-   * Expand into concrete intervals for the requested date range.
+6. **Discretize into slots** — align to `slotDuration` grid (e.g., 15 minutes). For each candidate slot start, verify `[start - buffer_before, start + duration + buffer_after]` fits within available intervals.
 
-3. **Apply exceptions**
-
-   * Remove PTO, holidays, maintenance blocks.
-
-4. **Compute required time window**
-
-   * `effective_duration = duration + buffer_before + buffer_after`
-
-5. **Subtract existing reservations**
-
-   * Query reservations for provider/room/equipment overlapping range.
-   * Remove occupied ranges from candidate intervals.
-
-6. **Discretize into slots**
-
-   * Align to `slotDuration` grid (e.g., 10 or 15 minutes).
-   * For each slot start, ensure `[start - buffer_before, start + duration + buffer_after]` fits.
-
-7. **Return slots**
-
-   * Each slot includes:
-
-     * local display times
-     * UTC times (for booking)
-     * availability boolean
-     * reason if unavailable (optional for UI conflict hints)
+7. **Return slots** — each slot includes local display times, UTC times (for booking), availability boolean, and optional reason if unavailable (for UI conflict hints).
 
 ### 3.3 Handling Concurrent Booking Attempts (Correctness)
 
 The system must prevent double booking even under races, retries, and partial failures.
 
-**Booking is done as a single database transaction**:
+**Booking is a single database transaction:**
 
-* insert appointment
-* insert reservations for required resources
-* commit
+1. INSERT appointment
+2. INSERT provider reservation (range includes buffers)
+3. INSERT room reservation (if needed)
+4. INSERT equipment reservation (if needed)
+5. COMMIT
 
-If reservation insert violates the exclusion constraint:
+If any reservation INSERT violates the exclusion constraint → ROLLBACK → return `409 Conflict` ("slot no longer available").
 
-* rollback
-* return `409 Conflict` (“slot no longer available”)
+This avoids the classic TOCTOU race: "check slot is free" then "book slot" with a gap in between.
 
-This avoids the classic bug:
+#### Concurrency sequence
 
-* “check slot free” then “book” (TOCTOU race)
-
-#### Concurrency sequence (Mermaid)
-
-```mermaid
-sequenceDiagram
-  participant UI as Client
-  participant API as Scheduling API
-  participant DB as PostgreSQL
-
-  UI->>API: POST /appointments (slot, type, provider) + Idempotency-Key
-  API->>DB: BEGIN
-  API->>DB: INSERT Appointment
-  API->>DB: INSERT Provider Reservation (range)
-  API->>DB: INSERT Room Reservation (if needed)
-  API->>DB: INSERT Equipment Reservation (if needed)
-  alt overlap constraint violated
-    API->>DB: ROLLBACK
-    API-->>UI: 409 Conflict (Slot taken)
-  else success
-    API->>DB: COMMIT
-    API-->>UI: 201 Created
-  end
-```
+![Sequence Diagram](./assets/Sequence_Diagram.jpg)
 
 ### 3.4 Complex Rules Support
 
-This design supports complex rules by separating:
+The design supports complex rules by separating concerns:
 
-* **Rules** (recurring availability)
-* **Exceptions** (one-off overrides)
-* **Constraints** (reservations + required resources)
-* **Preferences** (ranking rather than hard constraint)
+* **Rules** — recurring availability (what's normally possible)
+* **Exceptions** — one-off overrides (what's different today)
+* **Constraints** — reservations + required resources (what's already taken)
+* **Preferences** — ranking rather than hard constraint (what's preferred)
 
-Examples:
+**Provider preferences**: "Prefer mornings" → rank morning slots higher but still allow afternoons. "Prefer room 204" → attempt preferred room first, fall back to others.
 
-**Provider preferences**
+**Room/equipment capacity**: Most exam rooms are capacity 1 — one reservation fills them. For group sessions or shared equipment (e.g., 3 infusion pumps), I use a **sub-resource model**: capacity-N resources are expanded into N logical sub-resources (e.g., `pump:42#1`, `pump:42#2`, `pump:42#3`). Each sub-resource gets its own reservation row and participates in the same exclusion constraint. Assignment is first-available; sub-resources are treated as interchangeable. If sub-resources have meaningful differences (e.g., one pump is newer), they should be modeled as separate equipment entities rather than sub-resources — the distinction maps to whether the patient/provider cares which one they get. This approach is simpler and more correct than aggregation-based capacity counting, which requires careful transactional locking.
 
-* “Prefer mornings” → rank morning slots higher, but still allow afternoons.
-* “Prefer specific room” → attempt preferred room first, fallback to others.
+**Buffers**: buffer time is encoded in the reservation range (reservation range = buffer_before + clinical time + buffer_after). The appointment itself stores only the "clinical time" for display purposes. This means buffer enforcement is automatic — the exclusion constraint prevents bookings that would violate buffer periods.
 
-**Room capacity**
-
-* Most exam rooms are capacity 1.
-* Group sessions: room capacity > 1.
-* Implementation:
-
-  * either model capacity with multiple “sub-resources”
-  * or store reservations with “count” and enforce capacity via aggregation + locking.
-  * For simplicity and correctness, I prefer **sub-resources** for capacity > 1 (e.g., room:123#1, room:123#2).
-
-**Equipment capacity**
-
-* Similar to room capacity. For equipment that can be shared concurrently up to N:
-
-  * represent as N sub-resources or use a capacity counter with careful locking.
-  * Sub-resource modeling is simpler and avoids complex transactional aggregation.
-
-**Buffers**
-
-* Buffer time is enforced in reservations:
-
-  * reservation range includes buffer before/after
-  * appointment itself remains the “clinical time” (for display).
-
-**Clinic policies**
-
-* Minimum lead time (e.g., no same-day booking after 4pm)
-* Max booking window (e.g., 180 days)
-* Enforced in availability generation and on booking API.
+**Clinic policies**: minimum lead time (e.g., no same-day booking after 4pm), maximum booking window (e.g., 180 days out). Enforced both in availability generation (don't show invalid slots) and in the booking API (reject attempts that bypass the UI).
 
 ### 3.5 Time Zone Handling (and DST)
 
-**Storage**
+**Storage**: all persisted timestamps in UTC (`timestamptz`). Reservations use UTC ranges.
 
-* All persisted timestamps stored in UTC (`timestamptz`).
-* Reservations use UTC ranges.
+**Computation**: scheduling rules are defined in **clinic local time** (e.g., "Mon 9–5"). For a query range, the engine converts the query window into clinic timezone, expands rules in local time, then converts concrete intervals to UTC for reservation overlap checks.
 
-**Computation**
+**DST edge cases**:
 
-* Scheduling rules are defined in **clinic local time** (e.g., “Mon 9–5”).
-* For a query range:
+* Spring forward: some local times don't exist. Rule expansion must skip invalid times (e.g., 2:30am on spring-forward day).
+* Fall back: local times may repeat. Use timezone-aware conversion that preserves correct UTC mapping with explicit disambiguation.
 
-  * Convert query window into clinic timezone.
-  * Expand rules in local time.
-  * Convert concrete intervals to UTC for reservation overlap checks.
-
-**DST edge cases**
-
-* Spring forward: some local times do not exist.
-
-  * Rule expansion must skip invalid times.
-* Fall back: local times may repeat.
-
-  * Use timezone-aware conversion that produces correct UTC mapping and preserve disambiguation.
-
-**UI rule**
-
-* Web/mobile display times in the **clinic timezone** for clinic schedulers.
-* If patient-facing later, display in patient timezone with explicit labels.
+**UI rule**: web/mobile display times in the **clinic timezone** for staff schedulers. If patient-facing later, display in patient timezone with explicit labels (e.g., "3:00 PM ET").
 
 ---
 
@@ -530,28 +286,15 @@ Examples:
 
 ### 4.1 API Style: REST (+ real-time channel)
 
-REST is a good fit for:
+REST is a good fit here: clear resources (appointments, rules, availability), natural caching semantics, simplicity for mobile clients. GraphQL could be added later for complex composed views, but the core complexity in this system is correctness and concurrency, not over-fetching.
 
-* clear resources (appointments, rules, availability)
-* caching semantics
-* simplicity for mobile clients
-
-GraphQL can be added later if needed for complex composed views, but for this system the core complexity is not “over-fetching”; it’s correctness and concurrency.
-
-### 4.2 Endpoints (examples)
+### 4.2 Endpoints
 
 #### Availability
 
 * `GET /v1/availability`
 
-  * query:
-
-    * `clinicId`
-    * `providerId`
-    * `appointmentTypeId`
-    * `from` (ISO)
-    * `to` (ISO)
-    * optional `roomId`, `equipmentIds`
+  * query: `clinicId`, `providerId`, `appointmentTypeId`, `from` (ISO), `to` (ISO), optional `roomId`, `equipmentIds`
   * response:
 
     ```json
@@ -573,22 +316,10 @@ GraphQL can be added later if needed for complex composed views, but for this sy
 
 #### Appointments
 
-* `POST /v1/appointments`
-
-  * headers: `Idempotency-Key: <uuid>`
-  * body includes:
-
-    * clinicId
-    * patientId
-    * providerId
-    * appointmentTypeId
-    * startUtc
-    * optional notes/reason
-* `PUT /v1/appointments/{id}` (reschedule, update reason)
-* `DELETE /v1/appointments/{id}` (cancel; soft cancel)
-* `GET /v1/appointments`
-
-  * filters: clinicId, providerId, roomId, from/to, status
+* `POST /v1/appointments` — headers: `Idempotency-Key: <uuid>`, body: clinicId, patientId, providerId, appointmentTypeId, startUtc, optional notes/reason
+* `PUT /v1/appointments/{id}` — reschedule, update reason
+* `DELETE /v1/appointments/{id}` — soft cancel (preserves audit trail)
+* `GET /v1/appointments` — filters: clinicId, providerId, roomId, from/to, status
 
 #### Rules & Exceptions
 
@@ -599,64 +330,34 @@ GraphQL can be added later if needed for complex composed views, but for this sy
 
 ### 4.3 Real-Time Updates (WebSocket/SSE)
 
-Purpose: scheduler UI must refresh quickly when availability changes.
+Purpose: scheduler UI must refresh when availability changes without manual reload.
 
 Model:
 
-* Clients subscribe to channels:
+* Clients subscribe to channels: `clinic:{clinicId}`, `provider:{providerId}`
+* Server emits events: `availability.invalidated` (date range + resources affected), `appointment.created|updated|cancelled`
 
-  * `clinic:{clinicId}`
-  * `provider:{providerId}`
-* Server emits events:
-
-  * `availability.invalidated` (date range + resources affected)
-  * `appointment.created|updated|cancelled`
-
-Clients react by:
-
-* invalidating cache (TanStack Query) and refetching relevant queries.
-
-This avoids sending full availability payloads through real-time channel, and instead uses real-time messages as **cache invalidation signals** (simple, scalable).
+Clients react by invalidating TanStack Query cache entries and refetching relevant queries. This avoids sending full availability payloads through the real-time channel — real-time messages serve as **cache invalidation signals**, which is simple and scalable.
 
 ### 4.4 Rate Limiting
 
-Availability queries can be high volume (users scrolling weeks, multiple providers).
+Availability queries can be high volume (users scrolling weeks, browsing multiple providers).
 
-Rate limits:
+* Per user: 60 req/min for availability endpoints
+* Per clinic: global caps to prevent bug-induced floods
+* Stricter on any unauthenticated endpoints (if patient-facing booking added later)
 
-* per user: e.g., 60 req/min for availability
-* per clinic: global caps to prevent abuse or bug-induced floods
-* stricter on unauthenticated endpoints (if any patient-facing later)
-
-Implementation:
-
-* Redis token bucket keyed by `userId + route`.
+Implementation: Redis token bucket keyed by `userId + route`. Fallback to in-process token bucket if Redis is unavailable.
 
 ### 4.5 Caching Strategy
 
-**Cache what is expensive and safe: availability results**, not PHI-heavy objects.
+**Cache what is expensive and safe to cache: availability results**, not PHI-heavy objects.
 
-Availability caching:
+* Cache key: `availability:{clinicId}:{providerId}:{appointmentTypeId}:{dateBucket}:{version}`
+* TTL: short (30–120 seconds)
+* Invalidation: on appointment create/reschedule/cancel, bump a version counter for affected provider/clinic/day in Redis and publish invalidation event via real-time hub
 
-* cache key includes:
-
-  * clinicId
-  * providerId
-  * appointmentTypeId
-  * from/to bucket (e.g., day)
-  * “version” token (see invalidation)
-* TTL: short (e.g., 30–120 seconds)
-
-Invalidation:
-
-* On appointment create/reschedule/cancel:
-
-  * bump a version counter for affected provider/clinic/day in Redis
-  * publish invalidation event via real-time hub
-
-Important: cache is an optimization only.
-
-* If Redis is down, compute from PostgreSQL; slower but still correct.
+Cache is an optimization only. If Redis is down, compute from PostgreSQL directly — slower but still correct.
 
 ---
 
@@ -664,238 +365,209 @@ Important: cache is an optimization only.
 
 ### 5.1 Web + Mobile Structure
 
-* Web: Next.js app router (scheduler, admin).
-* Mobile: React Native (provider schedule and actions).
-* Shared package:
+* Web: Next.js app router (scheduler, admin, reporting).
+* Mobile: React Native (provider schedule view and day-of actions).
+* Shared monorepo package:
 
-  * API client
-  * domain types
-  * validation schemas (zod)
-  * time utilities (timezone-safe formatting)
+  * API client (typed fetch wrappers)
+  * Domain types (appointment, reservation, slot)
+  * Validation schemas (zod — used both for UI forms and API request validation)
+  * Time utilities (timezone-safe formatting, slot display helpers)
 
-This prevents drift between platforms.
+This prevents type drift between platforms and ensures business rules (e.g., "is this slot in the past?") are defined once.
 
 ### 5.2 State Management
 
-Principle: split state into:
+Principle: split state by source of truth:
 
-* **Server state**: fetched data, cached, invalidated → TanStack Query
-* **UI state**: local selections, modals, drag state → React state/hooks
-* **Global app state**: auth/session, feature flags → minimal store if needed
+* **Server state** (fetched, cached, invalidated) → TanStack Query. Scheduling UIs involve many queries and refetches; TanStack Query provides caching, retries, request deduplication, and programmatic invalidation — all essential for a scheduler.
+* **UI state** (local selections, drag position, modal open/close) → React state/hooks.
+* **Global app state** (auth/session, feature flags) → minimal context or store.
 
-Why:
+### 5.3 Optimistic Updates & Collaborative Scheduling
 
-* Scheduling UIs involve many queries and refetches; TanStack Query provides caching, retries, request dedupe, and invalidation primitives.
+Rescheduling is UX-critical (drag & drop on calendar).
 
-### 5.3 Optimistic Updates
+**Optimistic update flow:**
 
-Rescheduling is UX-critical (drag & drop).
+1. User drops appointment on new slot → UI immediately reflects the move.
+2. Send `PUT /appointments/{id}` with `Idempotency-Key`.
+3. If backend returns `409 Conflict`:
+   * Roll back UI to previous position.
+   * Show "slot taken" notification and trigger an availability refetch to propose nearest open slots.
 
-Approach:
+Optimism is safe because correctness is enforced server-side by the exclusion constraint.
 
-* optimistic UI update on drop
-* send `PUT /appointments/{id}` with idempotency key
-* if backend returns `409`:
-
-  * rollback UI
-  * show “slot taken” and propose nearest available slots (trigger availability fetch)
-
-Optimism is allowed because correctness is enforced server-side.
+**Collaborative scheduling challenge**: when multiple schedulers work the same provider's calendar simultaneously, they can see stale availability. The real-time WebSocket channel mitigates this: when Scheduler A books a slot, the invalidation event reaches Scheduler B's client within seconds, triggering a refetch. For high-contention scenarios (e.g., one provider with very limited availability), the UI can additionally show a **soft lock indicator** — a "someone is viewing this slot" hint via WebSocket presence, not a hard lock — to reduce wasted attempts. This is a progressive enhancement: the system is correct without it, but it improves UX under contention.
 
 ### 5.4 Offline Support Strategy (Mobile)
 
-Mobile must handle intermittent connectivity.
+Mobile must handle intermittent connectivity (providers moving between exam rooms, poor hospital Wi-Fi).
 
-Plan:
-
-* Cache “today + next N days” schedule locally (AsyncStorage/SQLite).
-* Queue write actions when offline:
-
-  * check-in, add note, cancel request, reschedule request
-* Each queued action includes:
-
-  * idempotency key
-  * intended change and timestamp
+* Cache "today + next 2 days" schedule locally (SQLite via WatermelonDB or similar).
+* Queue write actions when offline: check-in, add note, cancel request, reschedule request.
+* Each queued action includes an idempotency key, intended change, and timestamp.
 * Sync on reconnect:
 
-  * replay requests
-  * handle conflicts:
+  * Replay queued requests in order.
+  * Handle conflicts: reschedule conflicts → show conflict UI for user resolution. Check-in conflicts → server decides based on appointment status progression rules (e.g., can't check-in a cancelled appointment).
 
-    * reschedule conflicts → show conflict UI
-    * check-in conflicts → server decides based on appointment status progression rules
+* Show a **"pending sync" badge** on queued actions — offline must never lead to silent data loss.
 
-Offline must never lead to silent data loss:
+#### Offline sync flow (Mermaid)
 
-* show a “pending sync” indicator for queued actions.
+![Offline sync Diagram](./assets/Offline_Sync_flow.jpg)
 
 ### 5.5 Shared Code and Type Safety
 
-* Generate API types from shared domain models.
-* Validate inputs with schemas at boundaries:
-
-  * UI form validation with zod
-  * backend request validation with zod (or equivalent)
-
-Goal: no “stringly typed” scheduling logic.
+* Generate API types from shared domain models (single source of truth for types).
+* Validate inputs with zod schemas at boundaries: UI form validation and backend request validation use the same schemas.
+* Goal: no "stringly typed" scheduling logic — appointment status transitions, time formatting, and validation are type-checked.
 
 ---
 
-## 6. Scalability & Reliability
+## 6. Security & Multi-Tenancy
 
-### 6.1 Scaling with Clinic Count
+### 6.1 Multi-Tenant Isolation
 
-500 clinics and 50k appointments/day is moderate in raw throughput (~0.6 appts/sec average), but real load is spiky and interactive availability queries can be heavy.
+With 500 clinics, tenant isolation is critical — Clinic A must never see Clinic B's data.
 
-Scale strategy:
+**Strategy: application-enforced tenant isolation with `clinic_id` on every row.**
 
-* **Stateless API**: horizontal scaling behind load balancer.
-* **Postgres**: primary + read replicas for read-heavy views.
+* Every table with patient or scheduling data includes `clinic_id`.
+* All queries include `WHERE clinic_id = :currentClinicId`, enforced by a middleware layer that extracts the tenant from the authenticated JWT.
+* **PostgreSQL Row-Level Security (RLS)** as a defense-in-depth layer: even if application code has a bug that omits the `clinic_id` filter, RLS policies prevent cross-tenant data access at the database level.
+
+  ```sql
+  ALTER TABLE appointments ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY clinic_isolation ON appointments
+    USING (clinic_id = current_setting('app.current_clinic_id')::uuid);
+  ```
+
+* Multi-clinic staff (e.g., floating providers) have explicit `provider_clinic` memberships; they can only access clinics they belong to.
+
+### 6.2 PHI Protection
+
+* **Encryption at rest**: Postgres with volume-level encryption (managed DB services provide this by default). Application-level encryption for highly sensitive fields (SSN) if stored.
+* **Encryption in transit**: TLS everywhere — API gateway, database connections, Redis connections, inter-service communication.
+* **Minimize PHI in logs**: application logs use opaque IDs (patient_id, appointment_id), never names, DOBs, or medical details. A secure lookup tool allows authorized staff to resolve IDs when debugging.
+* **Audit logs** capture all data access and mutations with actor identity, timestamp, and before/after state — required for HIPAA compliance.
+* **Session management**: short-lived JWTs (15 min), refresh token rotation, automatic logout on inactivity.
+
+### 6.3 Authorization Model
+
+Role-based access control (RBAC) with clinic-scoped roles:
+
+* **Scheduler**: can view/create/modify appointments within their clinic(s).
+* **Provider**: can view their own schedule, check-in patients, add notes.
+* **Admin**: can manage rules, exceptions, rooms, equipment for their clinic.
+* **System Admin**: cross-clinic access for support and configuration.
+
+Permissions are checked at the API layer before any database access.
+
+---
+
+## 7. Scalability & Reliability
+
+### 7.1 Scaling with Clinic Count
+
+Per the capacity analysis (Section 1.4): 50k appointments/day is moderate throughput, but availability queries at peak can reach 30–60 reads/sec, and real-time connections scale with concurrent users.
+
+* **Stateless API**: horizontal scaling behind load balancer. Add nodes to handle availability query load.
+* **Postgres**: primary for writes + read replicas for read-heavy views (appointment lists, dashboards, reporting).
 * **Redis**: clustered/managed for caching and rate limiting.
-* **Async workers**: scale independently.
+* **Async workers**: scale independently based on event backlog.
 
-### 6.2 Database Scaling Strategy
+### 7.2 Database Scaling Strategy
 
-Start:
+**Phase 1 (launch):** Single Postgres primary (managed HA). Strong indexes for reservation overlap + appointment time queries. This handles the initial scale comfortably.
 
-* Single Postgres primary (HA managed).
-* Strong indexes for reservation overlap + appointment time queries.
+**Phase 2 (growth):** Add read replicas for appointment lists, reporting, dashboards. Keep all writes on primary — booking must never hit replicas.
 
-Next:
+**Phase 3 (scale):** Partition `reservations` and `appointments` by month (range partitioning on `start_time_utc`). Old partitions can be moved to cheaper storage or archived. If clinic count grows to thousands, consider partitioning by `clinic_id` range or migrating to Citus for distributed Postgres.
 
-* Add read replicas:
+### 7.3 Caching Layers
 
-  * appointment lists, reporting, dashboards.
-* Partition large tables by time:
+* **L1**: client-side query cache (TanStack Query) — zero latency for repeated requests within a session.
+* **L2**: Redis availability cache — shared across API instances, short TTL, versioned invalidation.
+* **Static content**: CDN for web assets. Never cache PHI responses at the edge without strict controls.
 
-  * reservations and appointments partitioned by month (or by clinic + month if needed).
-* Keep writes strongly consistent on primary (booking must not hit replicas).
+### 7.4 Failure Modes & Recovery
 
-### 6.3 Caching Layers
+| Failure | Impact | Recovery |
+|---|---|---|
+| **Redis outage** | Slower availability (cache miss every time), no rate limiting, no real-time invalidation | Compute from Postgres directly; UI falls back to polling; in-process rate limiter as temp protection |
+| **Postgres failover** | Brief unavailability of writes | Idempotency keys prevent double booking on retry; retry only on transient errors |
+| **Real-time channel down** | Stale availability in UI | UI continues to function via polling; refetch on user actions |
+| **Race condition / double booking** | N/A — prevented by design | DB exclusion constraint rejects overlap; multiple servers can safely race |
+| **Notification worker failure** | Delayed notifications | Transactional outbox ensures messages are retried until delivered; no appointment data loss |
 
-* L1: client-side query cache (TanStack Query)
-* L2: Redis availability cache
-* (Optional) CDN caching for static content only (never cache PHI responses at edge without strict controls)
+### 7.5 Data Consistency Model
 
-### 6.4 Failure Modes & Recovery
+* **Strong consistency** for booking operations (transactional, single primary).
+* **Eventual consistency** for notifications, analytics, EHR sync.
 
-**1) Redis outage**
-
-* Impact: slower availability responses, no rate limiting, no real-time invalidation.
-* Recovery:
-
-  * compute availability from Postgres directly
-  * degrade real-time: UI falls back to polling every X seconds
-  * rate limiting fallback: in-process limiter as temporary protection
-
-**2) Postgres failover / transient errors**
-
-* Booking APIs must retry carefully:
-
-  * idempotency keys prevent double booking from retries
-  * retry only on safe transient errors
-
-**3) Real-time channel down**
-
-* UI should still function:
-
-  * polling availability
-  * refetch on actions
-
-**4) Race conditions / double booking**
-
-* Prevented by DB exclusion constraints.
-* Even if multiple app servers race, DB rejects overlap.
-
-**5) Partial side effect failure (notification not sent)**
-
-* Use transactional outbox:
-
-  * appointment commit writes outbox record
-  * worker retries sending notifications until success
-  * ensures “appointment created” doesn’t get lost in side effects
-
-### 6.5 Data Consistency Model
-
-* Strong consistency for booking operations (transactional).
-* Eventual consistency for:
-
-  * notifications
-  * analytics
-  * EHR sync (depending on integration SLA)
-
-This prioritizes safety and correctness for scheduling.
+This prioritizes safety: the system never tells two people they both successfully booked the same slot.
 
 ---
 
-## 7. Observability
+## 8. Observability
 
-### 7.1 Logging Approach
+### 8.1 Logging Approach
 
-Structured JSON logs with:
-
-* `request_id` (correlation)
-* `user_id` (staff id)
-* `clinic_id`
-* `appointment_id` (when relevant)
-* route name, status code, latency
-* error codes and stack traces (non-PHI)
+Structured JSON logs with: `request_id` (correlation), `user_id`, `clinic_id`, `appointment_id` (when relevant), route name, status code, latency, error codes.
 
 Rules:
 
-* Do not log PHI (patient names, DOB, etc.) in application logs.
-* Use stable identifiers and secure lookups when debugging.
+* **Never log PHI** (patient names, DOB, medical details) in application logs.
+* Use stable identifiers and secure lookup tools when debugging.
 
-### 7.2 Metrics to Track
+### 8.2 Metrics to Track
 
-**API**
+**API**: request latency p50/p95/p99, error rate by endpoint, 409 conflict rate (booking collisions — a leading indicator of contention and UX issues).
 
-* request latency p50/p95/p99
-* error rate by endpoint
-* 409 conflict rate (booking collisions) — leading indicator of contention and UX issues
+**Availability engine**: compute latency on cache miss, cache hit ratio, slots computed per request (detects runaway date ranges).
 
-**Availability engine**
+**Database**: transaction time, lock wait time, constraint violation counts, slow query stats.
 
-* compute latency (when cache miss)
-* cache hit ratio
-* number of slots computed per request (to detect runaway ranges)
+**Real-time**: active WebSocket connections, message delivery latency, dropped event count.
 
-**Database**
+### 8.3 Alerting Strategy
 
-* transaction time
-* lock wait time
-* constraint violation counts
-* slow query stats
+Alerts should be actionable — every alert has a clear owner and response playbook:
 
-**Real-time**
+* Booking conflict rate spikes suddenly → possible bug, unusual contention, or UI issue.
+* Availability compute latency exceeds threshold for sustained period → cache miss storm or DB degradation.
+* DB lock waits or deadlocks increase → query pattern issue or contention hot spot.
+* Outbox backlog growth → notification worker is down or downstream provider is failing.
+* Elevated 5xx rate → general system health alarm.
 
-* active connections
-* message delivery latency
-* dropped events count
+### 8.4 Debugging Tools
 
-### 7.3 Alerting Strategy
+* **Audit log** for all appointment changes: who changed what, when, before → after state. This is both a debugging tool and a compliance requirement.
+* **Replayable requests** (redacted of PHI) linked by `request_id` for tracing failures across services.
+* **Admin "slot explanation" endpoint** (restricted to admin roles): given a provider, slot time, and appointment type, returns a structured explanation of why the slot is unavailable — provider exception, overlapping reservation, no room available, equipment constraint, or policy violation. Invaluable for support staff and eliminates guesswork when clinics report "I can't see any availability."
 
-Alerts should be actionable:
+---
 
-* booking conflict rate spikes suddenly (possible bug or unusual contention)
-* availability compute latency > threshold for sustained period
-* DB lock waits / deadlocks increase
-* outbox backlog growth (notifications not sending)
-* elevated 5xx rates
+## 9. Rollout Strategy
 
-### 7.4 Debugging Tools
+### 9.1 Phased Deployment
 
-* **Audit log** for all appointment changes:
+Rolling out to 500 clinics simultaneously is risky. A phased approach:
 
-  * who changed what, when, from → to
-* **Replayable requests** (redacted) linked by request_id.
-* Admin “slot explanation” endpoint (restricted):
+**Phase 1 — Pilot (2–3 clinics):** Deploy to a small group of friendly clinics. Validate correctness, identify UX issues, tune availability computation performance, and establish operational baselines.
 
-  * given a slot and appointment type, returns why it’s unavailable:
+**Phase 2 — Regional rollout (50 clinics):** Expand to a region. Monitor for scale-related issues (DB load, cache hit ratios). Use feature flags to control which clinics are on the new system vs. legacy.
 
-    * provider exception
-    * overlapping reservation
-    * no room available
-    * equipment constraint
-  * This is invaluable for support staff and reduces guesswork.
+**Phase 3 — Full rollout:** Migrate remaining clinics in batches (50–100 at a time). Keep legacy system running in parallel during migration window. Each clinic's migration includes data import, staff training, and a validation period.
+
+### 9.2 Feature Flags
+
+Feature flags control:
+
+* Which clinics use the new scheduling system vs. legacy.
+* Progressive feature enablement (e.g., WebSocket real-time updates can be enabled per-clinic after validating connectivity).
+* Quick rollback: disable new system for a clinic and revert to legacy without a deployment.
 
 ---
